@@ -1,0 +1,11 @@
+# Direct runtime dependencies. Windows is required for the application.
+# Not a lockfile: Windows version compatibility still needs validation.
+psutil
+keyboard
+pyperclip
+pywinauto; sys_platform == "win32"
+mss
+Pillow
+pytesseract
+openai
+rapidfuzz
