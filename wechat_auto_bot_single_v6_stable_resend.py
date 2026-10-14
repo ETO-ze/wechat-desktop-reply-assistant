@@ -61,6 +61,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import shutil
+import threading
 
 
 def load_local_dotenv(dotenv_path: Path):
@@ -155,7 +156,7 @@ DEFAULT_CONFIG = {
     ],
 
     "arm_minutes": 10,
-    "require_foreground_wechat": True,
+    "require_foreground_wechat": True,  # 兼容旧配置；发送路径始终要求微信在前台
     "confirm_before_send": True,
     "confirm_timeout_sec": 30,
 
@@ -174,7 +175,6 @@ DEFAULT_CONFIG = {
         "min_title_len": 1,                 # 标题长度过短则认为无效
         "title_update_cooldown": 0.8,       # 识别节流：避免频繁 OCR 标题
         "stability_required": 2,            # 需要连续 N 次识别到同一标题才切换（抗抖动）
-        "merge_similar_threshold": 92       # 标题相似度>=该阈值则视为同一联系人（合并 key）
     },
 
     "openai": {
@@ -454,6 +454,22 @@ class SelectedWindow:
     cls: str
     rect: Tuple[int, int, int, int]
 
+@dataclass(frozen=True)
+class ReplyContext:
+    person_key: str
+    title: str
+    hwnd: int
+    pid: int
+    generation: int
+
+
+@dataclass(frozen=True)
+class PendingReply:
+    text: str
+    context: ReplyContext
+    deadline: float
+
+
 class WeChatAutoBot:
     def __init__(self, cfg: Dict):
         self.cfg = cfg
@@ -475,8 +491,12 @@ class WeChatAutoBot:
         self.arm_until = 0.0
         self.auto_reply_enabled = bool(cfg["auto_reply"]["enabled_default"])
 
-        self.pending_reply: Optional[str] = None
-        self.pending_deadline: float = 0.0
+        # keyboard callbacks run on other threads. Bind each draft to its origin
+        # and invalidate in-flight API responses when that context changes.
+        self._state_lock = threading.RLock()
+        self._send_lock = threading.Lock()
+        self._generation = 0
+        self.pending_reply: Optional[PendingReply] = None
 
         self.win: Optional[SelectedWindow] = None
         self.app = None
@@ -545,6 +565,9 @@ class WeChatAutoBot:
         cls = w.get("class") or ""
 
         preferred = [x.lower() for x in self.cfg["preferred_proc_names"]]
+        # A large unrelated foreground window must never become a send target.
+        if pname not in preferred and not _any_hint_in(pname, self.cfg["soft_proc_hints"]):
+            return -1
         if pname in preferred:
             score += 20_000_000
         if _any_hint_in(pname, self.cfg["soft_proc_hints"]):
@@ -571,6 +594,7 @@ class WeChatAutoBot:
         )
 
     def connect(self):
+        self._invalidate_context()
         self.win = self.pick_window()
         try:
             self.app = Application(backend="uia").connect(handle=self.win.hwnd)
@@ -644,63 +668,106 @@ class WeChatAutoBot:
 
     # ---- 会话路由（根据聊天标题 OCR 自动切换 person_key） ----
 
-    def maybe_update_chat_key_by_title(self):
-        """根据 title OCR 更新当前会话 key（防抖：cooldown）"""
-        if self.cfg["session_routing"]["mode"] != "title_ocr":
-            return
+    def _invalidate_context(self):
+        """Cancel both a pending draft and any generation still in flight."""
+        with self._state_lock:
+            self._generation += 1
+            self.pending_reply = None
 
+    def _read_current_title(self) -> str:
+        """Fresh, exact OCR identity; never use fuzzy matches for sending."""
+        if not self.win or not _is_foreground(self.win.hwnd):
+            return ""
+        try:
+            rect = _get_rect(self.win.hwnd)
+            if not rect or _pid_of(self.win.hwnd) != self.win.pid:
+                return ""
+            self.win.rect = rect
+            img = self.screenshot_region(self._region_from_ratio("title"))
+            lines = filter_noise_lines(ocr_lines_tesseract(
+                img, self.cfg["tesseract_cmd"], self.cfg["tesseract_lang"]))
+            title = normalize_text(" ".join(lines[:2]))
+            if (not _is_foreground(self.win.hwnd)
+                    or len(title) < int(self.cfg["session_routing"]["min_title_len"])):
+                return ""
+            return title
+        except Exception:
+            return ""
+
+    def _local_context_valid(self, context: ReplyContext, deadline: float = 0.0) -> bool:
+        now = time.time()
+        return bool(
+            self.armed and now < self.arm_until
+            and (not deadline or now < deadline)
+            and self.win and self.uia_win
+            and self.person_key == context.person_key
+            and self._generation == context.generation
+            and self.win.hwnd == context.hwnd and self.win.pid == context.pid
+            and _is_foreground(context.hwnd)
+        )
+
+    def _context_valid(self, context: ReplyContext, deadline: float = 0.0) -> bool:
+        with self._state_lock:
+            if not self._local_context_valid(context, deadline):
+                return False
+        title = self._read_current_title()
+        with self._state_lock:
+            if not title or title != context.title:
+                self._invalidate_context()
+                return False
+            # Recheck after OCR: a hotkey can disarm/switch during the read.
+            return self._local_context_valid(context, deadline)
+
+    def _capture_context(self) -> Optional[ReplyContext]:
+        title = self._read_current_title()
+        with self._state_lock:
+            if not title or not self.win or not self.uia_win:
+                self._invalidate_context()
+                return None
+            if (self.cfg["session_routing"]["mode"] == "title_ocr"
+                    and title != self.person_key):
+                self._invalidate_context()
+                return None
+            context = ReplyContext(self.person_key, title, self.win.hwnd,
+                                   self.win.pid, self._generation)
+            return context if self._local_context_valid(context) else None
+
+    def maybe_update_chat_key_by_title(self) -> bool:
+        """Only process messages after an exact title has stabilized."""
+        if self.cfg["session_routing"]["mode"] != "title_ocr":
+            return True
         now = time.time()
         cooldown = float(self.cfg["session_routing"]["title_update_cooldown"])
         if now - self._last_title_update_ts < cooldown:
-            return
-
-        try:
-            title_rect = self._region_from_ratio("title")
-            img = self.screenshot_region(title_rect)
-            lines = ocr_lines_tesseract(img, self.cfg["tesseract_cmd"], self.cfg["tesseract_lang"])
-            lines = filter_noise_lines(lines)
-            text = sanitize_key(" ".join(lines[:2]))  # 通常标题一行就够，取前两行容错
-        except Exception:
-            return
-
-        # 标题稳定化：需要连续 N 次识别到同一个标题才切换
-        required = int(self.cfg["session_routing"].get("stability_required", 2))
-        if text != self._title_candidate:
-            self._title_candidate = text
-            self._title_candidate_count = 1
-            return
-        else:
-            self._title_candidate_count += 1
-            if self._title_candidate_count < max(1, required):
-                return
-
-        # 合并相似标题：避免 OCR 抖动把同一个人/群识别成多个 key
-        merge_th = int(self.cfg["session_routing"].get("merge_similar_threshold", 92))
-        known_keys = list(self.sessions.keys())
-        best_key = ""
-        best_score = -1
-        for k in known_keys:
-            s = fuzz.ratio(text, k)
-            if s > best_score:
-                best_score = s
-                best_key = k
-        if best_key and best_score >= merge_th:
-            text = best_key
-
-        if len(text) < int(self.cfg["session_routing"]["min_title_len"]):
-            return
-
+            return False
         self._last_title_update_ts = now
-
-        # 标题变化才更新
-        if text and text != self._last_title_key:
-            self._last_title_key = text
-            # 切换会话 key
-            self.person_key = text
-            # 切换后清空 OCR 记忆，避免把上一聊天尾部当“新消息”
-            self.prev_in_lines = []
-            self.prev_full_lines = []
-            print(f"[CHAT] 切换会话 key -> {self.person_key}")
+        text = self._read_current_title()
+        with self._state_lock:
+            # Invalidate immediately, before waiting for routing stability.
+            if not text or text != self._last_title_key:
+                self._invalidate_context()
+            if not text:
+                self._title_candidate = ""
+                self._title_candidate_count = 0
+                return False
+            if text != self._title_candidate:
+                self._title_candidate = text
+                self._title_candidate_count = 1
+            else:
+                self._title_candidate_count += 1
+            required = max(1, int(self.cfg["session_routing"].get("stability_required", 2)))
+            if self._title_candidate_count < required:
+                return False
+            # Do not merge similar titles: they can belong to different people.
+            if text != self._last_title_key or self.person_key != text:
+                self._last_title_key = text
+                self.person_key = text
+                self.prev_in_lines = []
+                self.prev_full_lines = []
+                self._prev_left_hash = None
+                self._prev_full_hash = None
+                print(f"[CHAT] 切换会话 key -> {self.person_key}")
+            return True
 
     # ---- 聚焦输入框与发送（安全发送链路） ----
 
@@ -715,106 +782,117 @@ class WeChatAutoBot:
         except Exception:
             return False
 
-    def verify_paste_in_input(self, expected: str, delay=0.08) -> bool:
-        """Ctrl+A/Ctrl+C 验证粘贴是否落在输入框"""
+    def _guarded_key(self, key: str, context: ReplyContext, deadline: float = 0.0) -> bool:
+        if not self._context_valid(context, deadline):
+            return False
+        with self._state_lock:
+            if not self._local_context_valid(context, deadline):
+                return False
+            keyboard.send(key)
+            return True
+
+    def verify_paste_in_input(self, expected: str, context: ReplyContext,
+                              deadline: float = 0.0, delay=0.08) -> bool:
+        """Verify exact input content without bypassing recipient checks."""
         clip_before = pyperclip.paste()
         try:
-            keyboard.send("ctrl+a"); time.sleep(delay)
-            keyboard.send("ctrl+c"); time.sleep(delay)
+            if not self._guarded_key("ctrl+a", context, deadline):
+                return False
+            time.sleep(delay)
+            # A sentinel avoids mistaking an unchanged clipboard for a copy.
+            pyperclip.copy("")
+            if not self._guarded_key("ctrl+c", context, deadline):
+                return False
+            time.sleep(delay)
             got = (pyperclip.paste() or "").strip()
-            exp = (expected or "").strip()
+            return bool(expected.strip()) and got == expected.strip()
+        except Exception:
+            return False
+        finally:
             pyperclip.copy(clip_before)
 
-            if not exp:
-                return False
-            if got == exp:
-                return True
-            if got.replace(" ", "") == exp.replace(" ", ""):
-                return True
-            if exp in got:
-                return True
+    def send_text(self, text: str, context: ReplyContext, deadline: float = 0.0) -> bool:
+        """Fail closed on Arm, window, exact title, epoch or deadline changes."""
+        if not text.strip() or not self._send_lock.acquire(blocking=False):
             return False
-        except Exception:
-            try:
-                pyperclip.copy(clip_before)
-            except Exception:
-                pass
-            return False
-
-    def send_text(self, text: str) -> bool:
-        """发送文本到当前聊天输入框（要求微信前台）"""
-        assert self.win is not None and self.uia_win is not None
-
-        if self.cfg["require_foreground_wechat"] and not _is_foreground(self.win.hwnd):
-            print("[SEND] 已阻止：微信不在前台。")
-            return False
-
         try:
-            self.uia_win.set_focus()
-        except Exception:
-            _focus_hwnd(self.win.hwnd)
+            if not self._context_valid(context, deadline):
+                print("[SEND] 已阻止：Arm、收件人、窗口或草稿有效期已改变。")
+                return False
+            # Never bring a background window forward to bypass the guard.
+            focused = False
+            for xr, yr in self.cfg["click_points"]:
+                if not self._context_valid(context, deadline):
+                    return False
+                if self.click_relative(float(xr), float(yr)):
+                    time.sleep(0.06)
+                    focused = True
+                    break
+            if not focused:
+                print("[SEND] 无法聚焦输入框区域。")
+                return False
 
-        focused = False
-        for xr, yr in self.cfg["click_points"]:
-            if self.click_relative(float(xr), float(yr)):
-                time.sleep(0.06)
-                focused = True
-                break
-        if not focused:
-            print("[SEND] 无法聚焦输入框区域。")
-            return False
+            clip_before = pyperclip.paste()
+            try:
+                pyperclip.copy(text)
+                if not self._guarded_key("ctrl+v", context, deadline):
+                    return False
+                time.sleep(0.10)
+            finally:
+                pyperclip.copy(clip_before)
 
-        clip_before = pyperclip.paste()
-        pyperclip.copy(text)
-        keyboard.send("ctrl+v"); time.sleep(0.10)
-        pyperclip.copy(clip_before)
+            if not self.verify_paste_in_input(text, context, deadline):
+                print("[SEND] 校验失败，已中止。请手动检查输入框中的残留文本。")
+                return False
+            # Fresh OCR immediately before Enter, independent of routing cache.
+            if not self._guarded_key("enter", context, deadline):
+                print("[SEND] 收件人或 Arm 已改变，未按回车；请手动检查输入框。")
+                return False
 
-        if not self.verify_paste_in_input(text):
-            print("[SEND] 校验失败：粘贴可能未落在输入框，已中止发送。")
-            return False
-
-        keyboard.send("enter")
-
-        # 记录本次发送文本，用于防自触发
-        self.state.setdefault("last_sent_text", {})[self.person_key] = text
-        save_json(STATE_PATH, self.state)
-
-        # 发送后 2 秒抑制 OCR 触发
-        self._suppress_until = time.time() + 2.0
-
-        print("[SEND] 已发送。")
-        return True
+            with self._state_lock:
+                # A reset after Enter must not resurrect cleared message data.
+                if self._generation == context.generation:
+                    self.state.setdefault("last_sent_text", {})[context.person_key] = text
+                    save_json(STATE_PATH, self.state)
+                self._suppress_until = time.time() + 2.0
+            print("[SEND] 已发送。")
+            return True
+        finally:
+            self._send_lock.release()
 
     # ---- 会话历史 ----
 
     def get_history(self) -> List[Dict]:
         return self.sessions.get(self.person_key, [])
 
-    def set_history(self, hist: List[Dict]):
+    def set_history(self, hist: List[Dict], person_key: Optional[str] = None):
         maxn = int(self.cfg["auto_reply"]["max_session_messages"])
         if len(hist) > maxn:
             hist = hist[-maxn:]
-        self.sessions[self.person_key] = hist
+        self.sessions[person_key if person_key is not None else self.person_key] = hist
         save_json(SESSIONS_PATH, self.sessions)
 
     def reset_current_session(self):
         """重置当前会话：清空历史 + 清空去重状态"""
-        self.sessions[self.person_key] = []
-        self.state.setdefault("last_sig", {})[self.person_key] = ""
-        self.state.setdefault("last_text", {})[self.person_key] = ""
-        self.state.setdefault("last_sent_text", {})[self.person_key] = ""
-        save_json(SESSIONS_PATH, self.sessions)
-        save_json(STATE_PATH, self.state)
-        self.prev_in_lines = []
-        self.prev_full_lines = []
-        print(f"[SESSION] 已重置：{self.person_key}")
+        with self._state_lock:
+            self._invalidate_context()
+            self.sessions[self.person_key] = []
+            self.state.setdefault("last_sig", {})[self.person_key] = ""
+            self.state.setdefault("last_text", {})[self.person_key] = ""
+            self.state.setdefault("last_sent_text", {})[self.person_key] = ""
+            save_json(SESSIONS_PATH, self.sessions)
+            save_json(STATE_PATH, self.state)
+            self.prev_in_lines = []
+            self.prev_full_lines = []
+            print(f"[SESSION] 已重置：{self.person_key}")
 
     # ---- 限频 ----
 
-    def _rate_bucket(self) -> Dict:
+    def _rate_bucket(self, person_key: Optional[str] = None) -> Dict:
+        key = person_key if person_key is not None else self.person_key
         self.state.setdefault("rate", {})
-        self.state["rate"].setdefault(self.person_key, {"t0": time.time(), "count": 0})
-        return self.state["rate"][self.person_key]
+        self.state["rate"].setdefault(key, {"t0": time.time(), "count": 0})
+        return self.state["rate"][key]
 
     def can_auto_reply(self) -> bool:
         bucket = self._rate_bucket()
@@ -829,10 +907,10 @@ class WeChatAutoBot:
             return False
         return True
 
-    def mark_sent(self):
-        bucket = self._rate_bucket()
+    def mark_sent(self, person_key: str):
+        bucket = self._rate_bucket(person_key)
         bucket["count"] += 1
-        self.state.setdefault("last_send_ts", {})[self.person_key] = time.time()
+        self.state.setdefault("last_send_ts", {})[person_key] = time.time()
         save_json(STATE_PATH, self.state)
 
     # ---- OCR 轮询：只以“左侧新消息”为触发 ----
@@ -841,7 +919,19 @@ class WeChatAutoBot:
         assert self.win is not None
 
         # 会话路由：先更新当前聊天 key（可选）
-        self.maybe_update_chat_key_by_title()
+        if not self.maybe_update_chat_key_by_title():
+            return
+
+        with self._state_lock:
+            poll_key = self.person_key
+            poll_generation = self._generation
+
+        # Bind the message read itself, not just the later API response.
+        source_context = None
+        if self.armed and self.auto_reply_enabled:
+            source_context = self._capture_context()
+            if source_context is None:
+                return
 
         # 发送后短时间抑制 OCR
         if time.time() < self._suppress_until:
@@ -862,15 +952,21 @@ class WeChatAutoBot:
                     if self.cfg["incoming_detection"]["mode"] == "left_only":
                         img_gate = self.screenshot_region(left_rect)
                         h = phash_ahash(img_gate, hash_size=hash_size)
-                        if self._prev_left_hash is not None and hamming_distance(h, self._prev_left_hash) <= thresh:
-                            return
-                        self._prev_left_hash = h
+                        with self._state_lock:
+                            if self.person_key != poll_key or self._generation != poll_generation:
+                                return
+                            if self._prev_left_hash is not None and hamming_distance(h, self._prev_left_hash) <= thresh:
+                                return
+                            self._prev_left_hash = h
                     else:
                         img_gate = self.screenshot_region(msg_rect)
                         h = phash_ahash(img_gate, hash_size=hash_size)
-                        if self._prev_full_hash is not None and hamming_distance(h, self._prev_full_hash) <= thresh:
-                            return
-                        self._prev_full_hash = h
+                        with self._state_lock:
+                            if self.person_key != poll_key or self._generation != poll_generation:
+                                return
+                            if self._prev_full_hash is not None and hamming_distance(h, self._prev_full_hash) <= thresh:
+                                return
+                            self._prev_full_hash = h
                 except Exception:
                     pass
 
@@ -883,8 +979,6 @@ class WeChatAutoBot:
                 lines = filter_noise_lines(lines)
                 if not lines:
                     return
-                delta = tail_delta(self.prev_in_lines, lines)
-                self.prev_in_lines = lines
             else:
                 img = self.screenshot_region(msg_rect)
                 lines = ocr_lines_tesseract(img, self.cfg["tesseract_cmd"], self.cfg["tesseract_lang"])
@@ -892,8 +986,6 @@ class WeChatAutoBot:
                 lines = filter_noise_lines(lines)
                 if not lines:
                     return
-                delta = tail_delta(self.prev_full_lines, lines)
-                self.prev_full_lines = lines
         except Exception as e:
             if self._tess_ok is not False:
                 self._tess_ok = False
@@ -901,57 +993,82 @@ class WeChatAutoBot:
                 print("[OCR] 解决：安装 Tesseract 或在 config 中设置 tesseract_cmd 为 tesseract.exe 的绝对路径。")
             return
 
-        if not delta:
+        if source_context is not None and not self._context_valid(source_context):
             return
+        with self._state_lock:
+            # Do not attach old OCR text or hashes to a newly selected slot.
+            if self.person_key != poll_key or self._generation != poll_generation:
+                return
+            if self.cfg["incoming_detection"]["mode"] == "left_only":
+                delta = tail_delta(self.prev_in_lines, lines)
+                self.prev_in_lines = lines
+            else:
+                delta = tail_delta(self.prev_full_lines, lines)
+                self.prev_full_lines = lines
+            if not delta:
+                return
 
-        delta_norm = normalize_text(delta)
+            delta_norm = normalize_text(delta)
 
-        # 防自触发：与最近一次发送内容相似则忽略
-        last_sent = (self.state.setdefault("last_sent_text", {}).get(self.person_key) or "").strip()
-        if last_sent and fuzz.ratio(delta_norm, normalize_text(last_sent)) >= 90:
-            sig_ = signature(delta_norm)
-            self.state.setdefault("last_sig", {})[self.person_key] = sig_
-            self.state.setdefault("last_text", {})[self.person_key] = delta_norm
-            save_json(STATE_PATH, self.state)
-            return
+            # 防自触发：与最近一次发送内容相似则忽略
+            last_sent = (self.state.setdefault("last_sent_text", {}).get(self.person_key) or "").strip()
+            if last_sent and fuzz.ratio(delta_norm, normalize_text(last_sent)) >= 90:
+                sig_ = signature(delta_norm)
+                self.state.setdefault("last_sig", {})[self.person_key] = sig_
+                self.state.setdefault("last_text", {})[self.person_key] = delta_norm
+                save_json(STATE_PATH, self.state)
+                return
 
-        sig = signature(delta_norm)
-        last_sig = (self.state.setdefault("last_sig", {}).get(self.person_key) or "")
-        if sig == last_sig:
-            return
+            sig = signature(delta_norm)
+            last_sig = (self.state.setdefault("last_sig", {}).get(self.person_key) or "")
+            if sig == last_sig:
+                return
 
-        # OCR 抖动去重
-        last_text = (self.state.setdefault("last_text", {}).get(self.person_key) or "")
-        if last_text and fuzz.ratio(delta_norm, last_text) >= 92:
+            # OCR 抖动去重
+            last_text = (self.state.setdefault("last_text", {}).get(self.person_key) or "")
+            if last_text and fuzz.ratio(delta_norm, last_text) >= 92:
+                self.state["last_sig"][self.person_key] = sig
+                self.state["last_text"][self.person_key] = delta_norm
+                save_json(STATE_PATH, self.state)
+                return
+
             self.state["last_sig"][self.person_key] = sig
             self.state["last_text"][self.person_key] = delta_norm
             save_json(STATE_PATH, self.state)
+
+            print(f"\n[IN] ({self.person_key}) {delta_norm}")
+
+            # 自动回复条件
+            if not (self.armed and self.auto_reply_enabled):
+                return
+            if not self.can_auto_reply():
+                print("[AUTO] 已限频，跳过本次。")
+                return
+
+        if source_context is None or not self._context_valid(source_context):
             return
+        self.generate_and_maybe_send(delta_norm, source_context)
 
-        self.state["last_sig"][self.person_key] = sig
-        self.state["last_text"][self.person_key] = delta_norm
-        save_json(STATE_PATH, self.state)
-
-        print(f"\n[IN] ({self.person_key}) {delta_norm}")
-
-        # 自动回复条件
-        if not (self.armed and self.auto_reply_enabled):
+    def generate_and_maybe_send(self, incoming_text: str,
+                                context: Optional[ReplyContext] = None):
+        """Bind the request before the API call; discard stale responses."""
+        context = context or self._capture_context()
+        if context is None or not self._context_valid(context):
+            print("[LLM] 已跳过：无法验证当前聊天或未 Arm。")
             return
-        if not self.can_auto_reply():
-            print("[AUTO] 已限频，跳过本次。")
-            return
-
-        self.generate_and_maybe_send(delta_norm)
-
-    def generate_and_maybe_send(self, incoming_text: str):
-        """生成回复：写会话→待发送→（可选确认）→发送"""
-        hist = self.get_history() + [{"role": "user", "content": incoming_text}]
-
+        with self._state_lock:
+            if not self._local_context_valid(context):
+                return
+            # A newer generation supersedes any older draft/request.
+            self._invalidate_context()
+            context = ReplyContext(context.person_key, context.title, context.hwnd,
+                                   context.pid, self._generation)
+            hist = list(self.sessions.get(context.person_key, []))
+        hist.append({"role": "user", "content": incoming_text})
         oa = self.cfg["openai"]
         try:
             reply = openai_generate_reply(
-                model=oa["model"],
-                system_prompt=oa["system_prompt"],
+                model=oa["model"], system_prompt=oa["system_prompt"],
                 temperature=float(oa.get("temperature", 0.4)),
                 history=hist[-int(self.cfg["auto_reply"]["max_session_messages"]):],
                 user_text="请给出回复：",
@@ -961,93 +1078,103 @@ class WeChatAutoBot:
         except Exception as e:
             print(f"[LLM] 调用失败：{e}")
             return
-
         reply = (reply or "").strip()
-        if not reply:
-            print("[LLM] 回复为空，跳过。")
+        if not reply or not self._context_valid(context):
+            print("[LLM] 回复为空或原会话已失效，已丢弃。")
             return
-
-        # 保存会话
-        hist.append({"role": "assistant", "content": reply})
-        self.set_history(hist)
-
-        self.pending_reply = reply
-        self.pending_deadline = time.time() + float(self.cfg["confirm_timeout_sec"])
-
-        print(f"[LLM] 已生成回复（{len(reply)} 字）")
+        with self._state_lock:
+            if not self._local_context_valid(context):
+                return
+            # History represents actual input plus only successfully sent replies.
+            self.set_history(hist, context.person_key)
+            self.pending_reply = PendingReply(
+                reply, context, time.time() + float(self.cfg["confirm_timeout_sec"]))
+            # Copy for review only. Pasting happens in the guarded send path.
+            pyperclip.copy(reply)
+        print(f"[LLM] 已生成回复给 {context.title}（{len(reply)} 字）")
         print(f"[LLM] {reply[:200]}{'...' if len(reply) > 200 else ''}")
-
-        # 复制到剪贴板，方便你手动编辑/确认
-        pyperclip.copy(reply)
-
         if self.cfg["confirm_before_send"]:
-            print("[AUTO] 需要确认：按 Ctrl+Alt+Y 发送（超时作废）。")
+            print("[AUTO] 需要确认：按 Ctrl+Alt+Y 发送（超时或切换聊天作废）。")
             return
-
-        ok = self.send_text(reply)
-        if ok:
-            self.mark_sent()
+        self.confirm_send_pending()
 
     # ---- 快捷键动作 ----
 
     def toggle_arm(self):
-        if self.armed:
-            self.armed = False
-            self.arm_until = 0.0
-            print("[ARM] 已关闭。")
-        else:
-            self.armed = True
-            self.arm_until = time.time() + float(self.cfg["arm_minutes"]) * 60.0
-            print(f"[ARM] 已开启，截止 {time.ctime(self.arm_until)}")
+        with self._state_lock:
+            self._invalidate_context()
+            if self.armed:
+                self.armed = False
+                self.arm_until = 0.0
+                print("[ARM] 已关闭，草稿作废。")
+            else:
+                self.armed = True
+                self.arm_until = time.time() + float(self.cfg["arm_minutes"]) * 60.0
+                print(f"[ARM] 已开启，截止 {time.ctime(self.arm_until)}")
 
     def toggle_auto(self):
-        if not self.armed:
-            print("[AUTO] 已阻止：未 Arm。")
-            return
-        self.auto_reply_enabled = not self.auto_reply_enabled
-        print(f"[AUTO] {'已开启' if self.auto_reply_enabled else '已关闭'}")
+        with self._state_lock:
+            if not self.armed or time.time() >= self.arm_until:
+                print("[AUTO] 已阻止：未 Arm。")
+                return
+            self.auto_reply_enabled = not self.auto_reply_enabled
+            if not self.auto_reply_enabled:
+                self._invalidate_context()
+            print(f"[AUTO] {'已开启' if self.auto_reply_enabled else '已关闭'}")
 
     def confirm_send_pending(self):
-        if not self.pending_reply:
+        with self._state_lock:
+            draft = self.pending_reply
+            # Consume atomically before sending so repeated hotkeys cannot resend.
+            self.pending_reply = None
+        if draft is None:
             print("[CONFIRM] 当前没有待发送回复。")
             return
-        if time.time() > self.pending_deadline:
-            print("[CONFIRM] 待发送回复已超时作废。")
-            self.pending_reply = None
+        if not self._context_valid(draft.context, draft.deadline):
+            print("[CONFIRM] 原会话、Arm 或草稿已失效。")
             return
-
-        ok = self.send_text(self.pending_reply)
-        if ok:
-            self.mark_sent()
-        self.pending_reply = None
+        if self.send_text(draft.text, draft.context, draft.deadline):
+            with self._state_lock:
+                self.mark_sent(draft.context.person_key)
+                if self._generation == draft.context.generation:
+                    hist = list(self.sessions.get(draft.context.person_key, []))
+                    hist.append({"role": "assistant", "content": draft.text})
+                    self.set_history(hist, draft.context.person_key)
 
     def manual_send_clipboard(self):
-        if (not self.armed) or (time.time() > self.arm_until):
-            print("[SEND] 已阻止：未 Arm 或已超时。")
+        self._invalidate_context()
+        context = self._capture_context()
+        if context is None:
+            print("[SEND] 已阻止：未 Arm 或无法验证聊天标题。")
             return
         text = (pyperclip.paste() or "").strip()
         if not text:
             print("[SEND] 剪贴板为空。")
             return
-        self.send_text(text)
+        self.send_text(text, context)
 
     def set_person_slot(self, idx: int):
-        """备用：手动切换 slot，会关闭 title_ocr 的自动切换效果（除非你把 mode 改回 slot）"""
-        idx = max(1, min(idx, 10))
-        self.person_key = self.slot_keys[idx - 1]
-        self.prev_in_lines = []
-        self.prev_full_lines = []
-        print(f"[CHAT] 手动切换会话 key -> {self.person_key}（如需禁用 title OCR，请在 config 中设置 session_routing.mode=slot）")
+        """Change only the history slot; fresh title checks remain mandatory."""
+        with self._state_lock:
+            self._invalidate_context()
+            idx = max(1, min(idx, 10))
+            self.person_key = self.slot_keys[idx - 1]
+            self.prev_in_lines = []
+            self.prev_full_lines = []
+            self._prev_left_hash = None
+            self._prev_full_hash = None
+        print(f"[CHAT] 手动切换会话 key -> {self.person_key}（如需禁用自动路由，请设置 session_routing.mode=slot）")
 
     def tick(self):
-        if self.armed and time.time() > self.arm_until:
-            self.armed = False
-            self.arm_until = 0.0
-            print("[ARM] 已超时关闭。")
-
-        if self.pending_reply and time.time() > self.pending_deadline:
-            print("[CONFIRM] 待发送回复已超时作废。")
-            self.pending_reply = None
+        with self._state_lock:
+            if self.armed and time.time() >= self.arm_until:
+                self.armed = False
+                self.arm_until = 0.0
+                self._invalidate_context()
+                print("[ARM] 已超时关闭，草稿作废。")
+            if self.pending_reply and time.time() >= self.pending_reply.deadline:
+                self.pending_reply = None
+                print("[CONFIRM] 待发送回复已超时作废。")
 
 # ---------- 配置合并 ----------
 
@@ -1115,3 +1242,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
